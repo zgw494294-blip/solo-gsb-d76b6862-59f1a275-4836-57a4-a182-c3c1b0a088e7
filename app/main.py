@@ -10,6 +10,11 @@
 - 合并两条条款时，按当前显示顺序用全角分号连接正文；合并结果沿用较前条款的稳定 id，
   较后条款删除，其 id 在所有正文中（含两条待合并正文）统一改写为较前条款 id。
   其他引用保持不动；已失效引用（id 已不存在于草稿）不会因合并恢复，仍保持失效。
+- 拆分一条条款时，在已保存正文上选定分界：分界不能切开任何 ``[[...]]`` 引用标记
+  （无论有效还是失效），两段都不得仅含空白，其余字符原样保留。前段沿用原 id，
+  后段使用本草稿从未用过的新 id（删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
+  只有指向被拆条款的引用（含两段内的自引用）统一改指选定的一段，其他引用不动；
+  后段紧跟前段插入，其余条款相对顺序不变；拆分后总数不得超过 40 条。
 """
 
 from __future__ import annotations
@@ -66,6 +71,15 @@ class MergeIn(BaseModel):
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
+
+
+class SplitIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    split_id: str  # 被拆分的条款（前段沿用其身份）
+    offset: int  # 分界在内部正文中的字符位置（按 Unicode 码点计）
+    route: str  # "front"：原指向本条的引用落到前段；"back"：落到后段
+    new_id: str  # 后段的新身份：本草稿从未使用过的稳定 id
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +330,78 @@ def merge_clauses(payload: MergeIn):
 
     new_order = [cid for cid in payload.order_ids if cid != payload.drop_id]
     return {"order_ids": new_order, "clauses": merged}
+
+
+@app.post("/api/split")
+def split_clause(payload: SplitIn):
+    """把一条已保存的正文拆成前后两段。
+
+    - ``offset`` 针对内部正文：不能切开任何 ``[[...]]`` 引用标记（有效或失效均须保持完整），
+      两段都不得仅含空白，其余字符原样保留（不做任何裁剪）。
+    - 前段沿用 ``split_id``，后段使用 ``new_id``：客户端保证其为本草稿从未用过的身份，
+      服务端校验它未被占用、也不被任何正文引用（否则拆分会让已有的失效引用复活）。
+    - 仅指向被拆条款的引用（含两段内的自引用）统一改指 ``route`` 选定的一段；
+      指向其他条款的引用不动，已失效引用保持失效。
+    - 后段紧跟前段插入，其余条款相对顺序不变；拆分后总数不得超过 ``MAX_LINES``。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    errors: list[str] = []
+    if payload.split_id not in by_id:
+        errors.append("被拆分的条款不存在")
+    if payload.route not in ("front", "back"):
+        errors.append("引用落点须为 front（前段）或 back（后段）")
+    if not ID_RE.match(payload.new_id):
+        errors.append(f"新条款身份非法：{payload.new_id}")
+    elif payload.new_id in by_id:
+        errors.append(f"新条款身份 {payload.new_id} 已被占用：删除或合并移除的身份不得复用")
+    elif any(
+        m.group(1) == payload.new_id
+        for clause in payload.clauses
+        for m in MARKER_RE.finditer(clause.body)
+    ):
+        errors.append(f"新条款身份 {payload.new_id} 与草稿中已有的失效引用冲突，拆分不得使其复活")
+    if len(payload.order_ids) + 1 > MAX_LINES:
+        errors.append(f"拆分后总数将为 {len(payload.order_ids) + 1} 条，超过 {MAX_LINES} 条上限")
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    body = by_id[payload.split_id].body
+    offset = payload.offset
+    if not (0 <= offset <= len(body)):
+        raise HTTPException(422, detail={"errors": ["分界超出正文范围"]})
+    for m in MARKER_RE.finditer(body):
+        if m.start() < offset < m.end():
+            raise HTTPException(
+                422,
+                detail={"errors": [f"分界不能切开引用标记 {m.group(0)}（有效或失效引用均须保持完整）"]},
+            )
+    front, back = body[:offset], body[offset:]
+    blank_parts = [name for name, seg in (("前段", front), ("后段", back)) if seg.strip() == ""]
+    if blank_parts:
+        raise HTTPException(
+            422,
+            detail={"errors": [f"两段都不得仅含空白字符：{'、'.join(blank_parts)}仅含空白"]},
+        )
+
+    target_id = payload.split_id if payload.route == "front" else payload.new_id
+
+    def repoint(m: re.Match) -> str:
+        return f"[[{target_id if m.group(1) == payload.split_id else m.group(1)}]]"
+
+    split_clauses: list[dict] = []
+    for clause in payload.clauses:
+        if clause.id == payload.split_id:
+            split_clauses.append({"id": clause.id, "body": MARKER_RE.sub(repoint, front)})
+            split_clauses.append({"id": payload.new_id, "body": MARKER_RE.sub(repoint, back)})
+        else:
+            split_clauses.append({"id": clause.id, "body": MARKER_RE.sub(repoint, clause.body)})
+
+    new_order: list[str] = []
+    for cid in payload.order_ids:
+        new_order.append(cid)
+        if cid == payload.split_id:
+            new_order.append(payload.new_id)
+    return {"order_ids": new_order, "clauses": split_clauses, "new_id": payload.new_id}
 
 
 @app.post("/api/preview")

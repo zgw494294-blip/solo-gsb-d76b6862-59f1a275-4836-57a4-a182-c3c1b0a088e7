@@ -8,6 +8,10 @@ const state = {
   orderIds: [],
   editingId: null,
   mergeIds: [], // 勾选待合并的两条条款 id
+  splittingId: null, // 正在选择拆分分界的条款 id（拆分界面打开期间，其他改稿操作同样锁定）
+  splitOffset: null, // 已选分界在内部正文中的码点位置（与 Python 字符串下标一致）
+  splitRoute: "front", // 原指向被拆条款的引用落到前段(front)还是后段(back)
+  nextIdNum: 1, // 下一个可用的全新身份编号：只增不减，删除/合并移除的身份永不复用
   preview: null, // 服务端 /api/preview 返回；仅当 previewFresh 为真时与当前草稿对应
   dragId: null,
   epoch: 0, // 草稿世代：导入成功 / 重新导入时 +1；上一草稿的迟到响应一律丢弃
@@ -16,8 +20,11 @@ const state = {
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
   merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
+  splitting: false, // /api/split 在途（期间阻止其他一切改稿操作）
   exporting: false, // /api/export 在途
 };
+
+const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不得超过它
 
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
@@ -96,7 +103,11 @@ function updateMergeBtn() {
     return;
   }
   mergeBtn.disabled =
-    state.editingId !== null || !state.previewFresh || state.mergeIds.length !== 2;
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.splitting ||
+    !state.previewFresh ||
+    state.mergeIds.length !== 2;
   mergeBtn.textContent =
     state.mergeIds.length === 2 ? "合并所选（2 条）" : "合并所选";
 }
@@ -105,6 +116,7 @@ function updateDownloadBtn() {
   downloadBtn.disabled =
     state.exporting ||
     state.merging ||
+    state.splitting ||
     !state.previewFresh ||
     !state.preview ||
     state.preview.has_broken;
@@ -142,6 +154,10 @@ importBtn.addEventListener("click", async () => {
     state.orderIds = state.clauses.map((c) => c.id);
     state.editingId = null;
     state.mergeIds = [];
+    state.splittingId = null;
+    state.splitOffset = null;
+    state.splitRoute = "front";
+    state.nextIdNum = state.clauses.length + 1; // 导入身份为 c1..cn，全新身份从 n+1 起
     state.preview = null;
     state.epoch += 1; // 新草稿世代：上一草稿的在途请求全部作废
     touch();
@@ -161,18 +177,23 @@ importBtn.addEventListener("click", async () => {
 
 $("#reimport-btn").addEventListener("click", () => {
   if (!confirm("重新导入将丢弃当前草稿，确定继续？")) return;
-  // 世代 +1：所有在途请求（预览 / 保存 / 合并 / 下载）的迟到响应都会被丢弃，
+  // 世代 +1：所有在途请求（预览 / 保存 / 合并 / 拆分 / 下载）的迟到响应都会被丢弃，
   // 其成功或失败不再影响新草稿及提示、按钮状态
   state.epoch += 1;
   state.clauses = [];
   state.orderIds = [];
   state.editingId = null;
   state.mergeIds = [];
+  state.splittingId = null;
+  state.splitOffset = null;
+  state.splitRoute = "front";
+  state.nextIdNum = 1;
   state.preview = null;
   state.previewFresh = false;
   state.rev += 1;
   state.saving = false;
   state.merging = false;
+  state.splitting = false;
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
   clauseList.classList.remove("busy");
@@ -203,7 +224,7 @@ async function render() {
   state.preview = data;
   state.previewFresh = true;
 
-  clauseList.classList.toggle("busy", state.merging);
+  clauseList.classList.toggle("busy", state.merging || state.splitting);
   clauseList.textContent = "";
   let brokenTotal = 0;
   const brokenLines = [];
@@ -226,33 +247,36 @@ async function render() {
     li.dataset.id = item.id;
 
     const isEditing = state.editingId === item.id;
+    const isSplitting = state.splittingId === item.id;
+    const locked = state.editingId || state.splittingId; // 编辑或拆分界面打开时，锁定各卡片的改稿操作
     li.innerHTML = `
       <div class="card-head">
         <input type="checkbox" class="merge-pick" title="勾选后与另一条合并（按当前显示顺序）"
           ${state.mergeIds.includes(item.id) ? "checked" : ""}
-          ${state.editingId ? "disabled" : ""} />
+          ${locked ? "disabled" : ""} />
         <span class="grip" title="拖拽调整顺序">⠿</span>
         <span class="num">${item.display}</span>
         <span class="orig">（原第 ${item.original} 条）</span>
         ${item.broken.length ? '<span class="warn-tag">含失效引用</span>' : ""}
         <span class="card-actions">
           ${
-            isEditing
+            isEditing || isSplitting
               ? ""
               : `<button data-action="up" ${
-                  item.display === 1 || state.editingId ? "disabled" : ""
+                  item.display === 1 || locked ? "disabled" : ""
                 }>↑</button>
                  <button data-action="down" ${
-                   item.display === data.items.length || state.editingId ? "disabled" : ""
+                   item.display === data.items.length || locked ? "disabled" : ""
                  }>↓</button>
-                 <button data-action="edit" ${state.editingId ? "disabled" : ""}>编辑正文</button>
+                 <button data-action="edit" ${locked ? "disabled" : ""}>编辑正文</button>
+                 <button data-action="split" ${locked ? "disabled" : ""}>拆分</button>
                  <button data-action="delete" class="danger" ${
-                   state.editingId ? "disabled" : ""
+                   locked ? "disabled" : ""
                  }>删除</button>`
           }
         </span>
       </div>
-      ${isEditing ? editorHtml(item) : `<div class="card-body">${bodyHtml(item)}</div>`}
+      ${isEditing ? editorHtml(item) : isSplitting ? splitterHtml(item) : `<div class="card-body">${bodyHtml(item)}</div>`}
     `;
     clauseList.appendChild(li);
   }
@@ -321,14 +345,213 @@ function editorHtml(item) {
 }
 
 // --------------------------------------------------------------------------- //
+// 拆分一条条款
+// --------------------------------------------------------------------------- //
+// 把内部正文切成“普通字符逐字 + 引用标记整体”的 token 序列，
+// 每个 token 标注码点位置（for..of / Array.from 按码点迭代，与 Python 字符串下标一致），
+// 分界只能落在 token 之间，因此引用标记（无论有效还是失效）永远不会被切开。
+function tokenizeForSplit(body) {
+  const tokens = [];
+  const re = /\[\[[^\[\]]*\]\]/g;
+  let pos = 0; // UTF-16 下标（供 slice 用）
+  let cp = 0; // 码点下标（发给服务端的 offset）
+  const pushChars = (text) => {
+    for (const ch of text) {
+      tokens.push({ kind: "ch", ch, cp });
+      cp += 1;
+    }
+  };
+  for (const m of body.matchAll(re)) {
+    pushChars(body.slice(pos, m.index));
+    tokens.push({ kind: "ref", id: m[0].slice(2, -2), cp });
+    cp += Array.from(m[0]).length;
+    pos = m.index + m[0].length;
+  }
+  pushChars(body.slice(pos));
+  return tokens;
+}
+
+// 与服务端 resolve_body 同一逻辑的本地解析：[[cN]] → [[当前显示号]] 或 [[原N?]]
+function resolveLocal(body) {
+  return body.replace(/\[\[c(\d+)\]\]/g, (m, num) => {
+    const pos = state.orderIds.indexOf(`c${num}`);
+    return pos >= 0 ? `[[${pos + 1}]]` : `[[原${num}?]]`;
+  });
+}
+
+function splitRefHtml(token) {
+  const pos = state.orderIds.indexOf(token.id);
+  if (pos >= 0) return `<span class="ref static">[[${pos + 1}]]</span>`;
+  return `<span class="ref dead static">[[原${token.id.slice(1)}?]]</span>`;
+}
+
+function splitterHtml(item) {
+  const clause = state.clauses.find((c) => c.id === item.id);
+  const tokens = tokenizeForSplit(clause.body);
+  let bodyStr = "";
+  tokens.forEach((t, i) => {
+    // 分界不能落在最前 / 最后（那样必有一段为空），只渲染 token 之间的分界
+    if (i > 0) {
+      bodyStr += `<span class="split-gap" data-offset="${t.cp}" title="在此拆分"></span>`;
+    }
+    bodyStr += t.kind === "ref" ? splitRefHtml(t) : `<span class="split-ch">${esc(t.ch)}</span>`;
+  });
+  const inbound = state.clauses.filter((c) => c.body.includes(`[[${item.id}]]`)).length;
+  return `
+    <div class="splitter">
+      <div class="split-hint">在已保存正文上点击字符间的分界位置（引用标记是不可切开的整体；两段都须含非空白字符，其余字符原样保留）：</div>
+      <div class="split-body">${bodyStr}</div>
+      ${
+        tokens.length < 2
+          ? '<div class="split-hint">正文过短，没有可拆分的分界位置。</div>'
+          : ""
+      }
+      <div class="split-segs" data-role="split-segs" hidden>
+        <div class="split-seg">
+          <span class="split-seg-label">前段（沿用原身份）</span>
+          <span class="split-seg-text" data-role="seg-front"></span>
+        </div>
+        <div class="split-seg">
+          <span class="split-seg-label">后段（新身份，紧跟前段）</span>
+          <span class="split-seg-text" data-role="seg-back"></span>
+        </div>
+      </div>
+      <div class="split-route">
+        原指向本条的引用（含自引用，涉及 ${inbound} 条条款）统一改指：
+        <label><input type="radio" data-role="split-route" name="split-route-${item.id}" value="front" checked /> 前段</label>
+        <label><input type="radio" data-role="split-route" name="split-route-${item.id}" value="back" /> 后段</label>
+      </div>
+      <div class="editor-actions">
+        <button data-action="split-confirm" class="primary" disabled>确认拆分</button>
+        <button data-action="split-cancel">取消</button>
+        <span class="edit-hint">其他引用与已失效引用不受影响；拆分后编号自动重排</span>
+      </div>
+      <ul class="edit-errors" data-role="split-errors" hidden></ul>
+    </div>`;
+}
+
+// 选中某个分界：高亮、预览前后两段（本地解析，编号为拆分前显示号）、本地预检空白段
+function selectSplitGap(card, offset) {
+  state.splitOffset = offset;
+  card
+    .querySelectorAll(".split-gap")
+    .forEach((g) => g.classList.toggle("on", parseInt(g.dataset.offset, 10) === offset));
+  const clause = state.clauses.find((c) => c.id === card.dataset.id);
+  const chars = Array.from(clause.body); // 按码点切片，与服务端一致
+  const front = chars.slice(0, offset).join("");
+  const back = chars.slice(offset).join("");
+  const segs = card.querySelector('[data-role="split-segs"]');
+  segs.hidden = false;
+  segs.querySelector('[data-role="seg-front"]').textContent = resolveLocal(front);
+  segs.querySelector('[data-role="seg-back"]').textContent = resolveLocal(back);
+  card.querySelector('[data-action="split-confirm"]').disabled = false;
+  const errs = [];
+  if (front.trim() === "") errs.push("前段不能只含空白字符，请重新选择分界");
+  if (back.trim() === "") errs.push("后段不能只含空白字符，请重新选择分界");
+  showSplitErrors(card, errs);
+}
+
+function showSplitErrors(card, errs) {
+  const box = card.querySelector('[data-role="split-errors"]');
+  if (!box) return;
+  if (!errs.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = errs.map((m) => `<li>${esc(m)}</li>`).join("");
+  box.hidden = false;
+}
+
+// 拆分提交期间禁用拆分界面按钮，结束后恢复（DOM 可能已被重建，按当前节点操作）
+function setSplitBusy(card, busy) {
+  const confirmBtn = card.querySelector('[data-action="split-confirm"]');
+  const cancelBtn = card.querySelector('[data-action="split-cancel"]');
+  if (confirmBtn) {
+    confirmBtn.disabled = busy;
+    confirmBtn.textContent = busy ? "拆分中…" : "确认拆分";
+  }
+  if (cancelBtn) cancelBtn.disabled = busy;
+}
+
+async function confirmSplit(id) {
+  if (state.splitting) return; // 阻止重复提交
+  const clause = state.clauses.find((c) => c.id === id);
+  const card = document.getElementById(`card-${id}`);
+  if (!clause || !card || state.splitOffset === null) return;
+
+  // 本地预检（服务端仍会权威校验）：任何一项不满足都不改草稿、不发请求
+  const chars = Array.from(clause.body);
+  const front = chars.slice(0, state.splitOffset).join("");
+  const back = chars.slice(state.splitOffset).join("");
+  const localErrs = [];
+  if (front.trim() === "") localErrs.push("前段不能只含空白字符，请重新选择分界");
+  if (back.trim() === "") localErrs.push("后段不能只含空白字符，请重新选择分界");
+  if (state.orderIds.length + 1 > MAX_CLAUSES)
+    localErrs.push(`拆分后总数将超过 ${MAX_CLAUSES} 条上限`);
+  if (localErrs.length) {
+    showSplitErrors(card, localErrs);
+    return;
+  }
+
+  const epoch = state.epoch;
+  // 提交期间阻止其他一切改稿操作（列表置灰），成功或失败后恢复
+  state.splitting = true;
+  clauseList.classList.add("busy");
+  setSplitBusy(card, true);
+  syncToolbar();
+  try {
+    const data = await api("/api/split", {
+      ...snapshot(),
+      split_id: id,
+      offset: state.splitOffset,
+      route: state.splitRoute,
+      new_id: `c${state.nextIdNum}`,
+    });
+    if (epoch !== state.epoch) return; // 已重新导入：旧拆分结果不得写回新草稿
+    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 引用跳转 / 下载立即对应同一份草稿
+    state.orderIds = data.order_ids;
+    state.clauses = data.clauses.map((c) => ({
+      id: c.id,
+      original: parseInt(c.id.slice(1), 10),
+      body: c.body,
+    }));
+    state.nextIdNum += 1; // 身份编号只增不减：删除 / 合并移除的身份永不复用
+    state.splittingId = null;
+    state.splitOffset = null;
+    state.splitRoute = "front";
+    state.splitting = false;
+    touch();
+    render();
+  } catch (e) {
+    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
+    // 拆分失败：草稿未改动，恢复被暂时阻止的操作，可修正分界后重试
+    state.splitting = false;
+    const cur = document.getElementById(`card-${id}`);
+    if (cur) {
+      setSplitBusy(cur, false);
+      showSplitErrors(cur, e.errors);
+    }
+  } finally {
+    clauseList.classList.toggle("busy", state.merging || state.splitting);
+    syncToolbar();
+  }
+}
+
+// --------------------------------------------------------------------------- //
 // 合并两条条款
 // --------------------------------------------------------------------------- //
 clauseList.addEventListener("change", (ev) => {
+  const routePick = ev.target.closest('[data-role="split-route"]');
+  if (routePick) {
+    state.splitRoute = routePick.value; // 原指向被拆条款的引用落到前段还是后段
+    return;
+  }
   const pick = ev.target.closest(".merge-pick");
   if (!pick) return;
   const id = pick.closest(".card").dataset.id;
-  if (state.merging) {
-    pick.checked = state.mergeIds.includes(id); // 合并提交期间不允许改动选择
+  if (state.merging || state.splitting) {
+    pick.checked = state.mergeIds.includes(id); // 合并 / 拆分提交期间不允许改动选择
     return;
   }
   if (pick.checked) {
@@ -347,9 +570,13 @@ clauseList.addEventListener("change", (ev) => {
 });
 
 mergeBtn.addEventListener("click", async () => {
-  if (state.merging) return; // 阻止重复提交
+  if (state.merging || state.splitting) return; // 阻止重复提交 / 拆分提交期间不可合并
   if (state.editingId) {
     alert("请先保存或取消正在编辑的正文，再合并条款。");
+    return;
+  }
+  if (state.splittingId) {
+    alert("请先确认或取消正在进行的拆分，再合并条款。");
     return;
   }
   if (state.mergeIds.length !== 2 || !state.previewFresh || !state.preview) return;
@@ -406,7 +633,7 @@ mergeBtn.addEventListener("click", async () => {
     state.merging = false;
     alert("合并失败，草稿未改动：\n" + e.errors.join("\n"));
   } finally {
-    clauseList.classList.toggle("busy", state.merging);
+    clauseList.classList.toggle("busy", state.merging || state.splitting);
     syncToolbar();
   }
 });
@@ -427,14 +654,25 @@ clauseList.addEventListener("click", async (ev) => {
     return;
   }
 
+  // 拆分界面中的分界点击：只更新本地选择，不改动草稿
+  const gap = ev.target.closest(".split-gap");
+  if (gap) {
+    if (state.splitting) return; // 提交期间不允许改选分界
+    selectSplitGap(gap.closest(".card"), parseInt(gap.dataset.offset, 10));
+    return;
+  }
+
   const btn = ev.target.closest("[data-action]");
   if (!btn) return;
   const card = btn.closest(".card");
   const id = card.dataset.id;
   const action = btn.dataset.action;
 
-  // 编辑中或合并提交中：阻止 编辑 / 删除 / 重排（按钮已禁用，这里再兜底）
-  if (["up", "down", "edit", "delete"].includes(action) && (state.editingId || state.merging))
+  // 编辑中、拆分界面打开或合并 / 拆分提交中：阻止 编辑 / 删除 / 重排 / 发起拆分（按钮已禁用，这里再兜底）
+  if (
+    ["up", "down", "edit", "delete", "split"].includes(action) &&
+    (state.editingId || state.splittingId || state.merging || state.splitting)
+  )
     return;
 
   if (action === "up" || action === "down") {
@@ -454,6 +692,24 @@ clauseList.addEventListener("click", async (ev) => {
         ta.addEventListener("keydown", onEditorKey);
       }
     });
+  } else if (action === "split") {
+    // 拆分针对已保存正文：有未保存编辑时按钮已禁用，这里再兜底
+    if (state.orderIds.length >= MAX_CLAUSES) {
+      alert(`当前共 ${state.orderIds.length} 条，拆分后将超过 ${MAX_CLAUSES} 条上限，请先合并或删除条款。`);
+      return;
+    }
+    state.splittingId = id;
+    state.splitOffset = null;
+    state.splitRoute = "front";
+    render();
+  } else if (action === "split-cancel") {
+    if (state.splitting) return; // 提交期间不允许取消（按钮已禁用，这里再兜底）
+    state.splittingId = null;
+    state.splitOffset = null;
+    state.splitRoute = "front";
+    render(); // 取消拆分：草稿不变，仅关闭拆分界面
+  } else if (action === "split-confirm") {
+    await confirmSplit(id);
   } else if (action === "delete") {
     const inbound = state.clauses.filter(
       (c) => c.id !== id && c.body.includes(`[[${id}]]`),
@@ -536,12 +792,13 @@ function attachDnd() {
   for (const card of clauseList.querySelectorAll(".card")) {
     const grip = card.querySelector(".grip");
     grip.addEventListener("mousedown", () => {
-      if (!state.editingId && !state.merging) card.draggable = true;
+      if (!state.editingId && !state.splittingId && !state.merging && !state.splitting)
+        card.draggable = true;
     });
     card.addEventListener("mouseup", () => (card.draggable = false));
 
     card.addEventListener("dragstart", (ev) => {
-      if (state.editingId || state.merging) {
+      if (state.editingId || state.splittingId || state.merging || state.splitting) {
         ev.preventDefault();
         return;
       }

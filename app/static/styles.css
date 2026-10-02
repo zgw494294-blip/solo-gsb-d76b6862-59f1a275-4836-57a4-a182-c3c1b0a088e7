@@ -123,7 +123,7 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 @media (max-width: 920px) { .columns { grid-template-columns: 1fr; } }
 
 .clause-list { list-style: none; margin: 0; padding: 0; }
-/* 合并提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选，结束后自动恢复 */
+/* 合并 / 拆分提交期间：暂时锁定列表内的编辑 / 删除 / 重排 / 勾选 / 分界选择，结束后自动恢复 */
 .clause-list.busy { pointer-events: none; opacity: 0.55; }
 
 .card {
@@ -202,6 +202,59 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .editor-actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
 .edit-errors { color: var(--danger); font-size: 12.5px; margin: 6px 0 0; padding-left: 18px; }
 .edit-hint { color: var(--muted); font-size: 12px; }
+
+/* 拆分界面：正文逐字展示，字符间的细缝是可点击的分界；引用标记为不可切开的整体 */
+.splitter { padding-left: 0; }
+.split-hint { color: var(--muted); font-size: 12.5px; margin: 6px 0; }
+.split-body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  background: #fafbfc;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  line-height: 2;
+  word-break: break-all;
+}
+.split-ch { white-space: pre-wrap; }
+.split-gap {
+  display: inline-block;
+  width: 6px;
+  height: 1.35em;
+  vertical-align: -0.3em;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+.split-gap:hover { border-left-color: #93c5fd; background: #eff6ff; }
+.split-gap.on { border-left-color: var(--primary); background: #dbeafe; }
+.ref.static { cursor: default; }
+.ref.static:hover { text-decoration: none; }
+.split-segs { margin-top: 8px; display: grid; gap: 6px; }
+.split-seg {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  background: #f8fafc;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.split-seg-label { flex: none; color: var(--muted); font-size: 12px; }
+.split-seg-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.split-route {
+  margin-top: 8px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+.split-route label { display: flex; gap: 4px; align-items: center; cursor: pointer; }
 
 .preview {
   margin: 0;
