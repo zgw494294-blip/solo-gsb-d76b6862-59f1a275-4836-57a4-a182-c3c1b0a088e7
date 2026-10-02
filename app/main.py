@@ -10,6 +10,11 @@
 - 合并两条条款时，按当前显示顺序用全角分号连接正文；合并结果沿用较前条款的稳定 id，
   较后条款删除，其 id 在所有正文中（含两条待合并正文）统一改写为较前条款 id。
   其他引用保持不动；已失效引用（id 已不存在于草稿）不会因合并恢复，仍保持失效。
+- 拆分一条条款时，在指定分界处把已保存正文切成前后两段：分界不能切开引用标记，
+  两段都不能只含空白，其余字符原样保留。前段沿用原稳定 id，后段使用前端分配的、
+  本草稿从未用过的全新 id（被删除或合并移除的 id 不复用，已有失效引用不会因此复活）；
+  指向被拆条款的全部引用（含两段中的自引用）按请求统一改指前段或后段，其余引用不动；
+  新条款在顺序表中紧跟前段，其余条款相对顺序不变。
 """
 
 from __future__ import annotations
@@ -66,6 +71,15 @@ class MergeIn(BaseModel):
     clauses: list[ClauseIn]
     keep_id: str  # 合并后沿用的身份（当前显示顺序中较前的一条）
     drop_id: str  # 被并入并移除的一条（当前显示顺序中较后的一条）
+
+
+class SplitIn(BaseModel):
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    split_id: str  # 被拆分的条款（前段沿用其身份）
+    offset: int  # 分界：已保存正文中的字符位置（按 Unicode 码位计）
+    new_id: str  # 后段的新身份（本草稿从未使用过的 id）
+    refs_to: str  # 原指向被拆条款的引用落到 "front"（前段）还是 "back"（后段）
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +330,87 @@ def merge_clauses(payload: MergeIn):
 
     new_order = [cid for cid in payload.order_ids if cid != payload.drop_id]
     return {"order_ids": new_order, "clauses": merged}
+
+
+@app.post("/api/split")
+def split_clause(payload: SplitIn):
+    """拆分一条条款。
+
+    - 在 ``offset`` 处把已保存正文切成前段 / 后段；分界不能切开引用标记，
+      两段都不能只含空白，其余字符原样保留。
+    - 前段沿用 ``split_id``，后段使用 ``new_id``；``new_id`` 不得与现有条款重复，
+      也不得出现在任何正文的引用中（被删除/合并移除的身份不能复用，
+      已有失效引用不能因此复活）。新条款在顺序表中紧跟前段，其余顺序不变。
+    - 指向 ``split_id`` 的全部引用（含两段中的自引用）统一改指 ``refs_to``
+      所选段；其余引用保持不动；已失效引用保持失效。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    errors: list[str] = []
+    if payload.split_id not in by_id:
+        errors.append("被拆分的条款不存在")
+    if not ID_RE.match(payload.new_id):
+        errors.append(f"后段新身份 id 非法：{payload.new_id}")
+    elif payload.new_id in by_id:
+        errors.append(f"后段新身份 {payload.new_id} 已被现有条款占用")
+    if payload.refs_to not in ("front", "back"):
+        errors.append("引用落点须为 front（前段）或 back（后段）")
+    if len(payload.order_ids) + 1 > MAX_LINES:
+        errors.append(
+            f"拆分后共 {len(payload.order_ids) + 1} 条，超过上限 {MAX_LINES} 条，不能拆分"
+        )
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+    # 新身份不得出现在任何正文的引用中：避免复用已删除/已合并移除的身份、复活失效引用
+    for clause in payload.clauses:
+        for m in MARKER_RE.finditer(clause.body):
+            if m.group(1) == payload.new_id:
+                raise HTTPException(
+                    422,
+                    detail={
+                        "errors": [
+                            f"后段新身份 {payload.new_id} 与既有引用冲突"
+                            "（该身份在本草稿中已被使用过，不能复用）"
+                        ]
+                    },
+                )
+
+    body = by_id[payload.split_id].body
+    offset = payload.offset
+    if not (0 <= offset <= len(body)):
+        raise HTTPException(
+            422,
+            detail={"errors": [f"分界位置 {offset} 超出正文范围（0～{len(body)}）"]},
+        )
+    for m in MARKER_RE.finditer(body):
+        if m.start() < offset < m.end():
+            raise HTTPException(
+                422,
+                detail={"errors": [f"分界不能切开引用标记 {m.group(0)}"]},
+            )
+    front, back = body[:offset], body[offset:]
+    if front.strip() == "" or back.strip() == "":
+        raise HTTPException(422, detail={"errors": ["拆分后的两段都不能只含空白字符"]})
+
+    def repoint(m: re.Match) -> str:
+        if payload.refs_to == "back" and m.group(1) == payload.split_id:
+            return f"[[{payload.new_id}]]"
+        return m.group(0)
+
+    split: list[dict] = []
+    for clause in payload.clauses:
+        if clause.id == payload.split_id:
+            split.append({"id": clause.id, "body": MARKER_RE.sub(repoint, front)})
+            split.append({"id": payload.new_id, "body": MARKER_RE.sub(repoint, back)})
+        else:
+            split.append({"id": clause.id, "body": MARKER_RE.sub(repoint, clause.body)})
+
+    new_order: list[str] = []
+    for cid in payload.order_ids:
+        new_order.append(cid)
+        if cid == payload.split_id:
+            new_order.append(payload.new_id)
+    return {"order_ids": new_order, "clauses": split}
 
 
 @app.post("/api/preview")

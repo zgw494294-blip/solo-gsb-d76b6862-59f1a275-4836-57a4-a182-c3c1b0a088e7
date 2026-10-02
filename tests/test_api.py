@@ -290,3 +290,245 @@ def test_merge_rejects_reversed_same_and_missing():
         json={"order_ids": ids4(), "clauses": bodies, "keep_id": "c1", "drop_id": "c9"},
     )
     assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# 拆分
+# --------------------------------------------------------------------------- #
+def _split(order, bodies, split_id, offset, new_id, refs_to="front"):
+    return client.post(
+        "/api/split",
+        json={
+            "order_ids": order,
+            "clauses": bodies,
+            "split_id": split_id,
+            "offset": offset,
+            "new_id": new_id,
+            "refs_to": refs_to,
+        },
+    )
+
+
+def test_split_front_keeps_identity_and_refs_stay():
+    bodies = _bodies(import_text(GOOD).json())
+    body = next(b["body"] for b in bodies if b["id"] == "c2")  # 乙方按 [[c1]] 验收后付款
+    offset = body.index("验") + 1
+    r = _split(ids4(), bodies, "c2", offset, "c5", refs_to="front")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 新条款紧跟前段，其余顺序不变
+    assert data["order_ids"] == ["c1", "c2", "c5", "c3", "c4"]
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    # 前段沿用原身份，后段获得新身份；两段字符原样保留
+    assert by["c2"] == "乙方按 [[c1]] 验"
+    assert by["c5"] == "收后付款"
+    assert by["c2"] + by["c5"] == body
+    # 引用落前段：c3 中指向 c2 的引用不变；两段内的原有引用保持绑定
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+
+    # 预览 / 导出立即对应同一份草稿
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert r.json()["has_broken"] is False
+    assert items["c2"]["display"] == 2
+    assert items["c5"]["display"] == 3
+    assert items["c2"]["text"] == "乙方按 [[1]] 验"
+    assert items["c3"]["text"] == "争议解决见 [[5]]，违约参照 [[2]]"
+
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 200
+    assert r.json()["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验",
+        "3|收后付款",
+        "4|争议解决见 [[5]]，违约参照 [[2]]",
+        "5|争议提交仲裁",
+    ]
+
+
+def test_split_refs_to_back_repoints_all_including_self_refs():
+    bodies = _bodies(import_text(GOOD).json())
+    # 先给 c2 加一个自引用（当前第 2 位就是 c2）
+    r = client.post(
+        "/api/save",
+        json={
+            "order_ids": ids4(),
+            "clauses": bodies,
+            "edit_id": "c2",
+            "text": "乙方按 [[1]] 验收后付款，并见 [[2]] 末款",
+        },
+    )
+    assert r.status_code == 200
+    bodies = [b if b["id"] != "c2" else {"id": "c2", "body": r.json()["body"]} for b in bodies]
+    body = next(b["body"] for b in bodies if b["id"] == "c2")
+    offset = body.index("，")  # 自引用 [[c2]] 落在后段
+    r = _split(ids4(), bodies, "c2", offset, "c5", refs_to="back")
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    # c3 原来指向 c2 的引用统一改指后段 c5
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c5]]"
+    # 后段中的自引用同样改指 c5；前段其余引用（[[c1]]）保持绑定
+    assert by["c2"] == "乙方按 [[c1]] 验收后付款"
+    assert by["c5"] == "，并见 [[c5]] 末款"
+
+
+def test_split_rejects_cutting_marker_but_allows_hugging_it():
+    bodies = _bodies(import_text(GOOD).json())
+    body = next(b["body"] for b in bodies if b["id"] == "c2")  # 乙方按 [[c1]] 验收后付款
+    start = body.index("[[c1]]")
+    end = start + len("[[c1]]")
+    # 分界落在标记内部：拒绝
+    for off in (start + 1, start + 3, end - 1):
+        r = _split(ids4(), bodies, "c2", off, "c5")
+        assert r.status_code == 422, off
+    # 紧贴标记两侧：允许，标记完整归入某一段
+    r = _split(ids4(), bodies, "c2", start, "c5")
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c2"] == "乙方按 "
+    assert by["c5"] == "[[c1]] 验收后付款"
+    r = _split(ids4(), bodies, "c2", end, "c5")
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c2"] == "乙方按 [[c1]]"
+    assert by["c5"] == " 验收后付款"
+
+
+def test_split_rejects_whitespace_only_segment():
+    bodies = _bodies(import_text(GOOD).json())
+    body = next(b["body"] for b in bodies if b["id"] == "c1")  # 甲方在七日内交付设备
+    # 分界在首尾：有一段为空
+    for off in (0, len(body)):
+        r = _split(ids4(), bodies, "c1", off, "c5")
+        assert r.status_code == 422, off
+    # 分界越界
+    for off in (-1, len(body) + 1):
+        r = _split(ids4(), bodies, "c1", off, "c5")
+        assert r.status_code == 422, off
+    # 正文以空白开头时，落在空白段内的分界会让前段只含空白
+    doc = import_text("1| 甲乙\n2|丙 [[1]]").json()
+    bodies2 = _bodies(doc)
+    r = _split(["c1", "c2"], bodies2, "c1", 1, "c3")
+    assert r.status_code == 422
+    # 空白之后的分界合法：前段字符（含空白）原样保留
+    r = _split(["c1", "c2"], bodies2, "c1", 2, "c3")
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c1"] == " 甲"
+    assert by["c3"] == "乙"
+
+
+def test_split_count_limit_40():
+    text = "\n".join(f"{i}|条款{i}" for i in range(1, 41))  # 40 条
+    bodies = _bodies(import_text(text).json())
+    order = [f"c{i}" for i in range(1, 41)]
+    r = _split(order, bodies, "c1", 2, "c41")
+    assert r.status_code == 422
+    # 39 条时拆分为第 40 条：允许
+    r = _split(order[:-1], bodies[:-1], "c1", 2, "c40")
+    assert r.status_code == 200, r.text
+    assert r.json()["order_ids"] == ["c1", "c40"] + [f"c{i}" for i in range(2, 40)]
+
+
+def test_split_new_id_must_be_fresh_and_not_revive_broken_refs():
+    bodies = _bodies(import_text(GOOD).json())
+    # 与现有条款身份冲突
+    r = _split(ids4(), bodies, "c2", 2, "c3")
+    assert r.status_code == 422
+    # 与被拆条款自身冲突
+    r = _split(ids4(), bodies, "c2", 2, "c2")
+    assert r.status_code == 422
+    # 非法 id 形态 / 非法落点
+    r = _split(ids4(), bodies, "c2", 2, "x5")
+    assert r.status_code == 422
+    r = _split(ids4(), bodies, "c2", 2, "c5", refs_to="middle")
+    assert r.status_code == 422
+    # 被拆条款不存在
+    r = _split(ids4(), bodies, "c9", 2, "c5")
+    assert r.status_code == 422
+
+    # 删除 c4 后，c3 中 [[c4]] 失效；新身份不得复用 c4（否则失效引用会复活）
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    r = _split(order, bodies3, "c2", 2, "c4")
+    assert r.status_code == 422
+    # 用全新身份则成功，且已有失效引用保持失效
+    r = _split(order, bodies3, "c2", 2, "c5")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_ids"] == ["c1", "c2", "c5", "c3"]
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.json()["has_broken"] is True
+    r = client.post("/api/export", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    assert r.status_code == 409
+
+
+def test_split_keeps_broken_refs_broken_in_segments():
+    bodies = _bodies(import_text(GOOD).json())
+    # 删除 c4：c3 中 [[c4]] 失效
+    order = ["c1", "c2", "c3"]
+    bodies3 = [b for b in bodies if b["id"] != "c4"]
+    body = next(b["body"] for b in bodies3 if b["id"] == "c3")  # 争议解决见 [[c4]]，违约参照 [[c2]]
+    offset = body.index("，")
+    r = _split(order, bodies3, "c3", offset, "c5", refs_to="front")
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    # 失效标记完整留在前段，仍保持失效；后段引用保持绑定
+    assert by["c3"] == "争议解决见 [[c4]]"
+    assert by["c5"] == "，违约参照 [[c2]]"
+    r = client.post("/api/preview", json={"order_ids": r.json()["order_ids"], "clauses": r.json()["clauses"]})
+    preview = r.json()
+    assert preview["has_broken"] is True
+    c3 = next(it for it in preview["items"] if it["id"] == "c3")
+    assert c3["broken"] == [{"ref_id": "c4", "original": 4}]
+    assert "[[原4?]]" in c3["text"]
+
+
+def test_split_in_reordered_doc_inserts_right_after_front():
+    bodies = _bodies(import_text(GOOD).json())
+    order = ["c4", "c1", "c2", "c3"]
+    r = _split(order, bodies, "c1", 3, "c5", refs_to="front")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 新条款紧跟前段，其余条款相对顺序不变
+    assert data["order_ids"] == ["c4", "c1", "c5", "c2", "c3"]
+    r = client.post("/api/preview", json={"order_ids": data["order_ids"], "clauses": data["clauses"]})
+    items = {it["id"]: it for it in r.json()["items"]}
+    assert items["c5"]["display"] == 3
+    # c2 对 c1 的引用按新显示位置解析，绑定不变
+    assert items["c2"]["text"] == "乙方按 [[2]] 验收后付款"
+
+
+def test_split_then_merge_and_merge_then_split():
+    bodies = _bodies(import_text(GOOD).json())
+    # 拆分后可以继续合并：拆 c2（引用落后段）→ 再合并前段 c2 与后段 c5
+    r = _split(ids4(), bodies, "c2", 2, "c5", refs_to="back")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    by = {c["id"]: c["body"] for c in data["clauses"]}
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c5]]"  # 指向 c2 的引用已落后段
+    r = client.post(
+        "/api/merge",
+        json={"order_ids": data["order_ids"], "clauses": data["clauses"], "keep_id": "c2", "drop_id": "c5"},
+    )
+    assert r.status_code == 200, r.text
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c2"] == "乙方；按 [[c1]] 验收后付款"
+    assert by["c3"] == "争议解决见 [[c4]]，违约参照 [[c2]]"  # 合并后引用改指合并结果
+
+    # 合并后可以继续拆分：合并 c1+c2 → 再拆合并结果
+    bodies = _bodies(import_text(GOOD).json())
+    r = client.post(
+        "/api/merge",
+        json={"order_ids": ids4(), "clauses": bodies, "keep_id": "c1", "drop_id": "c2"},
+    )
+    data = r.json()
+    body = next(c["body"] for c in data["clauses"] if c["id"] == "c1")
+    offset = body.index("；") + 1
+    r = _split(data["order_ids"], data["clauses"], "c1", offset, "c6", refs_to="front")
+    assert r.status_code == 200, r.text
+    assert r.json()["order_ids"] == ["c1", "c6", "c3", "c4"]
+    by = {c["id"]: c["body"] for c in r.json()["clauses"]}
+    assert by["c1"] == "甲方在七日内交付设备；"
+    # 后段中指向被拆条款（前段）的引用保持绑定
+    assert by["c6"] == "乙方按 [[c1]] 验收后付款"
